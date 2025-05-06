@@ -1,0 +1,631 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.linear_model import LinearRegression
+import numpy as np
+import random
+import time
+import logging
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from concurrent.futures import ThreadPoolExecutor
+import nltk
+from nltk.sentiment import SentimentIntensityAnalyzer
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("scraper.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("ecommerce_scraper")
+
+# List of user agents to rotate
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36"
+]
+
+class ProductScraper:
+    def __init__(self, max_retries=3, delay_between_requests=2):
+        self.max_retries = max_retries
+        self.delay = delay_between_requests
+        # Initialize selenium driver
+        self.setup_driver()
+        # Download NLTK data for sentiment analysis
+        try:
+            nltk.download('vader_lexicon', quiet=True)
+            self.sentiment_analyzer = SentimentIntensityAnalyzer()
+        except Exception as e:
+            logger.error(f"Failed to initialize sentiment analyzer: {e}")
+            self.sentiment_analyzer = None
+            
+    def setup_driver(self):
+        """Set up the Selenium WebDriver with appropriate options"""
+        try:
+            options = Options()
+            options.add_argument("--headless")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument(f"user-agent={random.choice(USER_AGENTS)}")
+            
+            # Additional settings to avoid detection
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option("useAutomationExtension", False)
+            
+            self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+            self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            logger.info("Selenium WebDriver initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize WebDriver: {e}")
+            raise
+
+    def get_headers(self):
+        """Generate headers with a random user agent"""
+        return {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
+        }
+
+    def make_request(self, url):
+        """Make HTTP request with retry mechanism"""
+        for attempt in range(self.max_retries):
+            try:
+                headers = self.get_headers()
+                response = requests.get(url, headers=headers, timeout=10)
+                if response.status_code == 200:
+                    time.sleep(self.delay)  # Respect websites by adding delay
+                    return response
+                logger.warning(f"Attempt {attempt+1} failed with status code {response.status_code}")
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Attempt {attempt+1} failed: {e}")
+            
+            # Exponential backoff
+            time.sleep(self.delay * (2 ** attempt))
+        
+        logger.error(f"Failed to retrieve {url} after {self.max_retries} attempts")
+        return None
+
+    def normalize_price(self, price_text):
+        """Extract and normalize price from various formats"""
+        if not price_text:
+            return None
+            
+        try:
+            # Remove currency symbols, commas, and extra text
+            price_text = price_text.replace('$', '').replace(',', '').replace('US', '')
+            
+            # Handle price ranges (take the lower price)
+            if ' to ' in price_text:
+                price_text = price_text.split(' to ')[0]
+            elif ' - ' in price_text:
+                price_text = price_text.split(' - ')[0]
+                
+            # Extract just the number
+            import re
+            price_match = re.search(r'(\d+\.\d+|\d+)', price_text)
+            if price_match:
+                return float(price_match.group(1))
+            return None
+        except Exception as e:
+            logger.warning(f"Price normalization error: {e}, text: {price_text}")
+            return None
+
+    def scrape_ebay(self, product, max_pages=3):
+        """Scrape eBay products with pagination"""
+        all_products = []
+        
+        for page in range(1, max_pages + 1):
+            url = f"https://www.ebay.com/sch/i.html?_nkw={product.replace(' ', '+')}&_pgn={page}"
+            logger.info(f"Scraping eBay page {page}: {url}")
+            
+            response = self.make_request(url)
+            if not response:
+                continue
+                
+            soup = BeautifulSoup(response.text, "html.parser")
+            
+            for item in soup.select(".s-item__pl-on-bottom"):
+                try:
+                    title_elem = item.select_one(".s-item__title")
+                    price_elem = item.select_one(".s-item__price")
+                    rating_elem = item.select_one(".x-star-rating")
+                    shipping_elem = item.select_one(".s-item__shipping")
+                    
+                    # Skip "Shop on eBay" items
+                    if title_elem and "Shop on eBay" in title_elem.text:
+                        continue
+                        
+                    title = title_elem.text.strip() if title_elem else "Unknown"
+                    price = self.normalize_price(price_elem.text if price_elem else None)
+                    
+                    # Get rating if available
+                    rating = None
+                    if rating_elem:
+                        rating_text = rating_elem.text
+                        if 'out of 5 stars' in rating_text:
+                            try:
+                                rating = float(rating_text.split(' out of ')[0])
+                            except ValueError:
+                                pass
+                    
+                    # Get shipping info
+                    shipping = shipping_elem.text.strip() if shipping_elem else "Unknown"
+                    
+                    if price:  # Only add if we have a valid price
+                        product_data = {
+                            "title": title,
+                            "price": price,
+                            "rating": rating,
+                            "shipping": shipping,
+                            "platform": "eBay"
+                        }
+                        all_products.append(product_data)
+                except Exception as e:
+                    logger.warning(f"Error processing eBay item: {e}")
+        
+        logger.info(f"Found {len(all_products)} products on eBay")
+        return all_products
+
+    def scrape_amazon(self, product, max_pages=3):
+        """Scrape Amazon products using Selenium with pagination"""
+        all_products = []
+        
+        try:
+            for page in range(1, max_pages + 1):
+                url = f"https://www.amazon.com/s?k={product.replace(' ', '+')}&page={page}"
+                logger.info(f"Scraping Amazon page {page}: {url}")
+                
+                self.driver.get(url)
+                
+                # Wait for products to load
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "[data-component-type='s-search-result']"))
+                )
+                
+                # Add random scrolling to mimic human behavior
+                self.scroll_page_randomly()
+                
+                soup = BeautifulSoup(self.driver.page_source, "html.parser")
+                
+                for item in soup.select("[data-component-type='s-search-result']"):
+                    try:
+                        title_elem = item.select_one("h2 a span")
+                        whole_price_elem = item.select_one(".a-price-whole")
+                        fraction_price_elem = item.select_one(".a-price-fraction")
+                        rating_elem = item.select_one(".a-icon-star-small")
+                        review_count_elem = item.select_one(".a-size-base.s-underline-text")
+                        
+                        title = title_elem.text.strip() if title_elem else "Unknown"
+                        
+                        # Combine whole and fraction parts of price
+                        price = None
+                        if whole_price_elem:
+                            price_text = whole_price_elem.text.strip()
+                            if fraction_price_elem:
+                                price_text += '.' + fraction_price_elem.text.strip()
+                            price = self.normalize_price(price_text)
+                        
+                        # Extract rating
+                        rating = None
+                        if rating_elem:
+                            rating_text = rating_elem.text
+                            if 'out of 5 stars' in rating_text:
+                                try:
+                                    rating = float(rating_text.split(' out of ')[0])
+                                except ValueError:
+                                    pass
+                        
+                        # Extract review count
+                        review_count = None
+                        if review_count_elem:
+                            try:
+                                review_text = review_count_elem.text.strip().replace(',', '')
+                                review_count = int(review_text) if review_text.isdigit() else None
+                            except ValueError:
+                                pass
+                        
+                        if price:  # Only add if we have a valid price
+                            product_data = {
+                                "title": title,
+                                "price": price,
+                                "rating": rating,
+                                "review_count": review_count,
+                                "platform": "Amazon"
+                            }
+                            all_products.append(product_data)
+                    except Exception as e:
+                        logger.warning(f"Error processing Amazon item: {e}")
+                
+                # Random delay between pages
+                time.sleep(random.uniform(2.0, 5.0))
+                
+        except Exception as e:
+            logger.error(f"Error scraping Amazon: {e}")
+        
+        logger.info(f"Found {len(all_products)} products on Amazon")
+        return all_products
+        
+    def scroll_page_randomly(self):
+        """Scroll the page randomly to mimic human behavior"""
+        page_height = self.driver.execute_script("return document.body.scrollHeight")
+        for _ in range(random.randint(5, 10)):
+            target_scroll = random.randint(0, page_height)
+            self.driver.execute_script(f"window.scrollTo(0, {target_scroll});")
+            time.sleep(random.uniform(0.5, 2.0))
+
+    def close(self):
+        """Clean up resources"""
+        if hasattr(self, 'driver'):
+            self.driver.quit()
+            logger.info("Selenium WebDriver closed")
+
+
+class DataAnalyzer:
+    def __init__(self, amazon_data, ebay_data):
+        """Initialize with scraped data and combine into a DataFrame"""
+        self.amazon_df = pd.DataFrame(amazon_data) if amazon_data else pd.DataFrame()
+        self.ebay_df = pd.DataFrame(ebay_data) if ebay_data else pd.DataFrame()
+        
+        # Combine data
+        self.df = pd.concat([self.amazon_df, self.ebay_df])
+        
+        # Clean data
+        self.clean_data()
+        
+    def clean_data(self):
+        """Clean and prepare the DataFrame"""
+        # Remove duplicates
+        self.df.drop_duplicates(subset=['title', 'price'], inplace=True)
+        
+        # Handle missing values
+        self.df['rating'] = self.df['rating'].fillna(0)  # Fill missing ratings with 0
+        self.df['review_count'] = self.df['review_count'].fillna(0)  # Fill missing review counts with 0
+        
+        # Create a price category column
+        self.df['price_category'] = pd.qcut(
+            self.df['price'], 
+            q=4, 
+            labels=['Budget', 'Economy', 'Mid-range', 'Premium']
+        )
+        
+        # Log the data shape
+        logger.info(f"Data prepared: {self.df.shape[0]} products, {self.df.shape[1]} features")
+
+    def get_price_statistics(self):
+        """Calculate price statistics by platform"""
+        stats = self.df.groupby('platform')['price'].agg([
+            'count', 'min', 'max', 'mean', 'median', 'std'
+        ]).round(2)
+        
+        # Add price range
+        stats['range'] = stats['max'] - stats['min']
+        
+        return stats
+        
+    def get_competitive_analysis(self):
+        """Analyze which platform offers better prices for similar products"""
+        # This is a simplified approach that looks at average prices in each category
+        return self.df.groupby(['platform', 'price_category'])['price'].agg(['mean', 'count']).round(2)
+    
+    def predict_future_prices(self, num_predictions=5):
+        """Linear regression model to predict future prices"""
+        if len(self.df) < 10:  # Need minimum data points
+            logger.warning("Not enough data for price prediction")
+            return None, None
+            
+        # Sort by price and create index
+        df_sorted = self.df.sort_values(by='price')
+        df_sorted['index'] = range(len(df_sorted))
+        
+        X = df_sorted['index'].values.reshape(-1, 1)
+        y = df_sorted['price'].values
+        
+        model = LinearRegression()
+        model.fit(X, y)
+        
+        # Create future indices
+        future_indices = np.array([[len(df_sorted) + i] for i in range(1, num_predictions + 1)])
+        predictions = model.predict(future_indices)
+        
+        # Calculate confidence metrics
+        score = model.score(X, y)
+        
+        prediction_data = {
+            'index': [i[0] for i in future_indices],
+            'predicted_price': predictions,
+            'model_score': score
+        }
+        
+        return pd.DataFrame(prediction_data), model
+
+    def create_visualization_data(self):
+        """Prepare data for visualizations"""
+        return {
+            'price_stats': self.get_price_statistics(),
+            'competitive_analysis': self.get_competitive_analysis(),
+            'full_data': self.df
+        }
+
+
+class Visualizer:
+    def __init__(self, analysis_data):
+        """Initialize with analysis data"""
+        self.data = analysis_data
+        
+        # Set up styling
+        sns.set_style("whitegrid")
+        plt.rcParams['figure.figsize'] = (12, 8)
+        plt.rcParams['font.size'] = 12
+        
+    def create_price_distribution(self):
+        """Create price distribution visualization"""
+        df = self.data['full_data']
+        
+        fig = plt.figure(figsize=(14, 8))
+        
+        # Create price distribution by platform
+        ax = sns.histplot(
+            data=df,
+            x='price',
+            hue='platform',
+            bins=20,
+            kde=True,
+            element='step',
+            palette=['#4285F4', '#DB4437']  # Google blue and red
+        )
+        
+        ax.set_title('Price Distribution by Platform', fontsize=16)
+        ax.set_xlabel('Price ($)', fontsize=14)
+        ax.set_ylabel('Count', fontsize=14)
+        
+        # Add vertical lines for mean prices
+        for platform, color in zip(['Amazon', 'eBay'], ['#4285F4', '#DB4437']):
+            platform_mean = df[df['platform'] == platform]['price'].mean()
+            plt.axvline(x=platform_mean, color=color, linestyle='--', 
+                         label=f'{platform} Mean: ${platform_mean:.2f}')
+        
+        plt.legend(title='Platform', fontsize=12)
+        plt.tight_layout()
+        plt.savefig('price_distribution.png', dpi=300)
+        
+        return fig
+        
+    def create_price_boxplot(self):
+        """Create box plot comparing price ranges"""
+        df = self.data['full_data']
+        
+        fig = plt.figure(figsize=(10, 6))
+        
+        ax = sns.boxplot(
+            data=df,
+            x='platform',
+            y='price',
+            palette=['#4285F4', '#DB4437']
+        )
+        
+        # Add swarm plot for individual points
+        sns.swarmplot(
+            data=df,
+            x='platform',
+            y='price',
+            size=4,
+            color='black',
+            alpha=0.5
+        )
+        
+        ax.set_title('Price Comparison: Amazon vs eBay', fontsize=16)
+        ax.set_xlabel('Platform', fontsize=14)
+        ax.set_ylabel('Price ($)', fontsize=14)
+        
+        plt.tight_layout()
+        plt.savefig('price_boxplot.png', dpi=300)
+        
+        return fig
+        
+    def create_price_prediction_chart(self, predictions, model):
+        """Visualize price predictions"""
+        if predictions is None or model is None:
+            return None
+            
+        df = self.data['full_data'].sort_values('price')
+        df['index'] = range(len(df))
+        
+        X = df['index'].values.reshape(-1, 1)
+        y = df['price'].values
+        
+        fig = plt.figure(figsize=(12, 7))
+        
+        # Plot actual prices
+        plt.scatter(
+            X, y, 
+            color='#0F9D58',  # Google green
+            alpha=0.7, 
+            label='Actual Prices'
+        )
+        
+        # Plot regression line
+        line_x = np.linspace(0, max(predictions['index']), 100).reshape(-1, 1)
+        plt.plot(
+            line_x, model.predict(line_x), 
+            color='#4285F4',  # Google blue
+            linestyle='-', 
+            linewidth=2,
+            label='Price Trend'
+        )
+        
+        # Plot predictions
+        plt.scatter(
+            predictions['index'], 
+            predictions['predicted_price'],
+            color='#DB4437',  # Google red
+            marker='*', 
+            s=200, 
+            label='Predicted Prices'
+        )
+        
+        plt.title(f'Price Prediction (R² Score: {model.score(X, y):.2f})', fontsize=16)
+        plt.xlabel('Product Index', fontsize=14)
+        plt.ylabel('Price ($)', fontsize=14)
+        plt.legend(fontsize=12)
+        
+        # Add confidence area
+        from sklearn.metrics import mean_squared_error
+        rmse = np.sqrt(mean_squared_error(y, model.predict(X)))
+        plt.fill_between(
+            line_x.flatten(), 
+            model.predict(line_x) - rmse, 
+            model.predict(line_x) + rmse,
+            color='#4285F4',  # Google blue
+            alpha=0.1,
+            label='Confidence (±RMSE)'
+        )
+        
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig('price_prediction.png', dpi=300)
+        
+        return fig
+
+    def create_interactive_plots(self):
+        """Create interactive plots with Plotly"""
+        df = self.data['full_data']
+        
+        # Interactive Price Comparison
+        fig = make_subplots(
+            rows=1, cols=2,
+            subplot_titles=("Price Distribution", "Price vs. Rating"),
+            specs=[[{"type": "box"}, {"type": "scatter"}]]
+        )
+        
+        # Box plot in the first subplot
+        for platform, color in zip(['Amazon', 'eBay'], ['#4285F4', '#DB4437']):
+            platform_data = df[df['platform'] == platform]
+            
+            fig.add_trace(
+                go.Box(
+                    y=platform_data['price'],
+                    name=platform,
+                    boxmean=True,
+                    marker_color=color
+                ),
+                row=1, col=1
+            )
+        
+        # Scatter plot in the second subplot
+        for platform, color in zip(['Amazon', 'eBay'], ['#4285F4', '#DB4437']):
+            platform_data = df[df['platform'] == platform]
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=platform_data['rating'],
+                    y=platform_data['price'],
+                    mode='markers',
+                    marker=dict(
+                        size=10,
+                        color=color,
+                        opacity=0.7
+                    ),
+                    name=platform,
+                    text=platform_data['title'],
+                    hovertemplate=
+                    "<b>%{text}</b><br>" +
+                    "Price: $%{y:.2f}<br>" +
+                    "Rating: %{x:.1f}/5<br>"
+                ),
+                row=1, col=2
+            )
+        
+        # Update layout
+        fig.update_layout(
+            title="Interactive Price Analysis: Amazon vs eBay",
+            height=600,
+            width=1200,
+            showlegend=True,
+            template="plotly_white"
+        )
+        
+        # Update axes
+        fig.update_xaxes(title_text="Platform", row=1, col=1)
+        fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+        
+        fig.update_xaxes(title_text="Rating (out of 5)", row=1, col=2)
+        fig.update_yaxes(title_text="Price ($)", row=1, col=2)
+        
+        # Export to HTML file
+        fig.write_html("interactive_analysis.html")
+        return fig
+
+
+def main():
+    # Define search term
+    product_name = "wireless headphones"
+    logger.info(f"Starting scraper for: {product_name}")
+    
+    # Initialize scraper
+    scraper = ProductScraper(max_retries=3, delay_between_requests=2)
+    
+    try:
+        # Scrape data from both platforms
+        amazon_results = scraper.scrape_amazon(product_name, max_pages=2)
+        ebay_results = scraper.scrape_ebay(product_name, max_pages=2)
+        
+        # Analyze data
+        analyzer = DataAnalyzer(amazon_results, ebay_results)
+        
+        # Display statistical insights
+        print("\n=== Price Statistics by Platform ===")
+        print(analyzer.get_price_statistics())
+        
+        print("\n=== Competitive Analysis ===")
+        print(analyzer.get_competitive_analysis())
+        
+        # Generate predictions
+        predictions, model = analyzer.predict_future_prices()
+        
+        if predictions is not None:
+            print("\n=== Price Predictions ===")
+            print(predictions)
+        
+        # Create visualizations
+        vis_data = analyzer.create_visualization_data()
+        visualizer = Visualizer(vis_data)
+        
+        # Generate and show visualizations
+        visualizer.create_price_distribution()
+        visualizer.create_price_boxplot()
+        visualizer.create_price_prediction_chart(predictions, model)
+        visualizer.create_interactive_plots()
+        
+        logger.info("Analysis and visualization completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Error in main process: {e}")
+        raise
+    finally:
+        # Clean up resources
+        scraper.close()
+
+
+if __name__ == "__main__":
+    main()
